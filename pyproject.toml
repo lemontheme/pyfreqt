@@ -1,0 +1,19 @@
+[tool.poetry]
+
+name = "pyfreqt"
+version = "0.1.0"
+description = "Frequent subtree mining based on FREQT algorithm (Asai, 2001)"
+authors = ["Adriaan Lemmens <lemontheme@gmail.com>"]
+license = "MIT"
+packages = [
+    { include = "pyfreqt", from = "src" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
