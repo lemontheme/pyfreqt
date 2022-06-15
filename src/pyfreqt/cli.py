@@ -38,11 +38,11 @@ def run_freqt(
         min_support=min_support,
         min_nodes=min_patt_size,
         max_nodes=max_patt_size,
-        # cache_dir=Path(cache_dir) if cache_dir else None,
+        cache_dir=Path(cache_dir) if cache_dir else None,
         weighted=True
     )
     # original: 11_693_846
-    max_trees = 1_000_000
+    max_trees = 10_000
     freqt.index_trees(it.islice(in_ndsexp, max_trees), total=max_trees)
     logger.info("Initial tree indexing complete.")
     patt: SubtreeDict

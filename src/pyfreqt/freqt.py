@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import struct
 import itertools as it
+import functools as ft
 from dataclasses import dataclass, field, asdict as dataclass_as_dict
 from collections import defaultdict
 from pathlib import Path
@@ -140,10 +141,10 @@ class FREQTOriginal:
     # NEW
     def iter_subtrees(self) -> Iterator[SubtreeDict]:
         # Single-node tree occurence list
-        freq1: defaultdict[str, ProjectedTree] = defaultdict(ProjectedTree)
+        freq1: defaultdict[tuple[str], ProjectedTree] = defaultdict(ProjectedTree)
         for i, transaction in self._transaction_store:
             for j, node in enumerate(transaction):
-                freq1[node.value].locations.append((i, j))
+                freq1[(node.value,)].locations.append((i, j))
 
         self._prune(freq1)
 
@@ -152,7 +153,7 @@ class FREQTOriginal:
             pattern_toks: tuple[str] = (single_node_pattern,)
             yield from self._project_iter_v2(project_t, pattern_toks)
 
-    def _prune(self, candidates: dict[str, ProjectedTree]) -> None:
+    def _prune(self, candidates: dict[tuple[str, ...], ProjectedTree]) -> None:
         pattern: str
         candidate: ProjectedTree
         to_prune = []
@@ -165,10 +166,12 @@ class FREQTOriginal:
         for item in to_prune:
             del candidates[item]
 
-    def _project_iter_v2(self, projected_tree: ProjectedTree, pattern_toks: tuple[str]) -> Iterator[SubtreeDict]:
+    def _project_iter_v2(
+        self, projected_tree: ProjectedTree, pattern_toks: tuple[str, ...]
+    ) -> Iterator[SubtreeDict]:
         """Generate candidate."""
-        stack: list[tuple[tuple[str], ProjectedTree]] = [(pattern_toks, projected_tree)]
-        candidates: defaultdict[str, ProjectedTree] = defaultdict(ProjectedTree)
+        stack: list[tuple[tuple[str, ...], ProjectedTree]] = [(pattern_toks, projected_tree)]
+        candidates: defaultdict[tuple[str, ...], ProjectedTree] = defaultdict(ProjectedTree)
 
         min_nodes: int = self.min_nodes
         max_nodes: int = self.max_nodes
@@ -201,7 +204,7 @@ class FREQTOriginal:
 
             for transaction_idx, initial_pos_idx in projected_tree.locations:
                 pos_idx: int = initial_pos_idx
-                prefix: str = ""
+                prefix: tuple[str, ...] = ()
                 current_depth: int = -1
                 transaction_nodes: list[Node] = self._transaction_store[transaction_idx]
                 while current_depth < tree_depth and pos_idx != -1:
@@ -214,7 +217,7 @@ class FREQTOriginal:
                     next_node_idx = start  # 'l' in reference.
                     while next_node_idx != -1:
                         next_node: Node = transaction_nodes[next_node_idx]
-                        item = f"{prefix} {next_node.value}"
+                        item: tuple[str, ...] = prefix + (next_node.value,)
                         candidate = candidates[item]
                         candidate.locations.append((transaction_idx, next_node_idx))
                         candidate.depth = new_depth
@@ -222,16 +225,16 @@ class FREQTOriginal:
                         next_node_idx = next_node.sibling
                     if current_depth != -1:
                         pos_idx = transaction_nodes[pos_idx].parent  # Go up right-most branch.
-                    prefix = f"{prefix} )"
+                    prefix += (")",)
                     current_depth += 1
 
             self._prune(candidates)
 
-            pattern: str
+            pattern: tuple[str, ...]
             project_t: ProjectedTree
 
             for pattern, project_t in candidates.items():
-                new_pattern_toks = pattern_toks + tuple(pattern.split())
+                new_pattern_toks = pattern_toks + pattern
                 stack.append((new_pattern_toks, project_t))
 
     def _compute_support(self, projected_tree: ProjectedTree) -> int:
@@ -276,14 +279,14 @@ class FREQTOriginal:
 
 ArrayTree = list[Node]
 
-# TODO: test whether this improves mining speed.
+# This does not improve __getitem__ performance. (In fact, it slows it down by 2x.)
 # def serialize_array_tree(array_tree: ArrayTree) -> bytes:
 #     return msgpack.packb([dataclass_as_dict(node) for node in array_tree])
 #
 #
 # def deserialize_array_tree(data: bytes | memoryview) -> ArrayTree:
 #     return [Node(**x) for x in msgpack.unpackb(data)]
-#
+# #
 
 
 class InMemoryTreeTransactionsStore:
@@ -334,6 +337,7 @@ class LMDBTreeTransactionsStore:
                 next_key = 0
             bin_keys_iter = (struct.pack("n", i) for i in it.count(next_key))
             bin_trees_iter = (pickle.dumps(t, protocol=5) for t in trees)
+            # bin_trees_iter = (serialize_array_tree(t) for t in trees)
             index_stream = zip(bin_keys_iter, bin_trees_iter)
             cursor.putmulti(index_stream, dupdata=False, append=True)
 
@@ -344,6 +348,7 @@ class LMDBTreeTransactionsStore:
             for k_bin, v_bin in cursor:
                 (k,) = struct.unpack("n", k_bin)
                 nodes = pickle.loads(v_bin)
+                # nodes = deserialize_array_tree(v_bin)
                 yield k, nodes
 
     def __getitem__(self, idx: int) -> ArrayTree:
@@ -351,10 +356,14 @@ class LMDBTreeTransactionsStore:
         with self._lmdb_env.begin(db=self._txn_db, buffers=True) as txn:
             v = txn.get(k_bin)
             if v is None:
-                print(v)
                 raise IndexError
             else:
                 return pickle.loads(v)
+            # return deserialize_array_tree(v)
+
+    # @ft.cached_property
+    # def __read_txn(self):
+    #     return self._lmdb_env.begin(db=self._txn_db, buffers=True)
 
 
 # class OnDiskList:
