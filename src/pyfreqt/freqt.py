@@ -7,7 +7,7 @@ import functools as ft
 from dataclasses import dataclass, field, asdict as dataclass_as_dict
 from collections import defaultdict
 from pathlib import Path
-from typing import Tuple, List, Iterable, Optional, Iterator, TypedDict, Dict
+from typing import Tuple, List, Iterable, Optional, Iterator, TypedDict, Dict, Callable
 import pickle
 
 import msgpack
@@ -28,6 +28,7 @@ class ProjectedTree:  # struct projected_t in reference implementation.
     depth: int = -1
     support: int = 0
     locations: List[Tuple[int, int]] = field(default_factory=list)
+    n_nodes: int = -1
 
 
 class _SubtreeRightMostChildLocation(TypedDict):
@@ -119,6 +120,7 @@ class FREQTOriginal:
     max_nodes: int = 10e4  # `max_pat` in reference. doc: max pattern length
     weighted: bool = False  # Use weighted support.
     enc: bool = False  # Use internal string encoding format as output.
+    prune_pred: Callable = None
     cache_dir: Optional[Path] = None
     _transaction_store: InMemoryTreeTransactionsStore | LMDBTreeTransactionsStore = field(
         init=False, repr=False, default_factory=list
@@ -131,6 +133,8 @@ class FREQTOriginal:
             self._transaction_store = LMDBTreeTransactionsStore(db_path=transactions_db_prefix)
         else:
             self._transaction_store = InMemoryTreeTransactionsStore()
+        if self.prune_pred is None:
+            self.prune_pred = lambda patt_toks, support, n_nodes: True
 
     # NEW
     def index_trees(self, s_exprs: Iterable[str], total: int = None) -> None:
@@ -146,25 +150,13 @@ class FREQTOriginal:
             for j, node in enumerate(transaction):
                 freq1[(node.value,)].locations.append((i, j))
 
-        self._prune(freq1)
+        # self._prune(freq1)
 
         for single_node_pattern, project_t in tqdm(freq1.items(), desc="Starting nodes explored"):
             project_t.depth = 0
-            pattern_toks: tuple[str] = (single_node_pattern,)
+            # project_t.n_nodes = 1
+            pattern_toks: tuple[str] = single_node_pattern
             yield from self._project_iter_v2(project_t, pattern_toks)
-
-    def _prune(self, candidates: dict[tuple[str, ...], ProjectedTree]) -> None:
-        pattern: str
-        candidate: ProjectedTree
-        to_prune = []
-        for item, project_t in candidates.items():
-            support: int = self._compute_support(project_t)
-            if support < self.min_support:
-                to_prune.append(item)
-            else:
-                project_t.support = support
-        for item in to_prune:
-            del candidates[item]
 
     def _project_iter_v2(
         self, projected_tree: ProjectedTree, pattern_toks: tuple[str, ...]
@@ -178,19 +170,26 @@ class FREQTOriginal:
 
         while stack:
             pattern_toks, projected_tree = stack.pop()
-            # No `else` to limit
-            # indentation.
-            # action != "resize" -> action == "project"
-            # n_nodes = len(pattern_toks)
+
+            # <Pruning Step>
+            support: int = self._compute_support(projected_tree)
+            if support < self.min_support:
+                continue
             n_nodes = sum(1 for tok in pattern_toks if tok != ")")
-            # print(pattern_toks, n_nodes)
-            if min_nodes <= n_nodes <= max_nodes:
+            if n_nodes > max_nodes:
+                continue
+            if not self.prune_pred(pattern_toks, support, n_nodes):
+                continue
+            # </Pruning Step>
+
+            projected_tree.support = support
+            projected_tree.n_nodes = n_nodes
+
+            if min_nodes <= n_nodes:
                 # In reference, this was side-effectual and was located in the body of
                 # the for-loop over candidates. I've moved it here so that the calling
                 # function iter_subtrees() doesn't have to duplicate filtering logic.
-                yield self._report(projected_tree, pattern_toks, n_nodes)
-            if n_nodes >= max_nodes:
-                continue
+                yield self._report(projected_tree, pattern_toks)
 
             tree_depth = projected_tree.depth
             # Find all candidates by expanding right-most branch.
@@ -228,14 +227,30 @@ class FREQTOriginal:
                     prefix += (")",)
                     current_depth += 1
 
-            self._prune(candidates)
-
-            pattern: tuple[str, ...]
-            project_t: ProjectedTree
-
             for pattern, project_t in candidates.items():
                 new_pattern_toks = pattern_toks + pattern
                 stack.append((new_pattern_toks, project_t))
+
+    # def _prune(self, candidates: dict[tuple[str, ...], ProjectedTree]) -> None:
+    #     pattern: tuple[str, ...]
+    #     candidate: ProjectedTree
+    #     to_prune = []
+    #     for pattern, project_t in candidates.items():
+    #         support: int = self._compute_support(project_t)
+    #         if support < self.min_support:
+    #             to_prune.append(pattern)
+    #             continue
+    #         n_nodes = sum(1 for tok in pattern if tok != ")")
+    #         if n_nodes > self.max_nodes:
+    #             to_prune.append(pattern)
+    #             continue
+    #         # if not self.custom_criterion(patt_toks, support, n_nodes):
+    #         #     to_prune.append(patt_toks)
+    #         #     continue
+    #         project_t.support = support
+    #         project_t.n_nodes = n_nodes
+    #     for pattern in to_prune:
+    #         del candidates[pattern]
 
     def _compute_support(self, projected_tree: ProjectedTree) -> int:
         tree = projected_tree
@@ -251,7 +266,7 @@ class FREQTOriginal:
 
     @staticmethod
     def _report(
-        projected_tree: ProjectedTree, pattern_toks: tuple[str], n_nodes: int
+        projected_tree: ProjectedTree, pattern_toks: tuple[str]
     ) -> Optional[SubtreeDict]:
         s_exp: str = ""
         par_balance: int = 0
@@ -267,7 +282,7 @@ class FREQTOriginal:
         weighted_support = len(projected_tree.locations)  # ?
         return SubtreeDict(
             pattern=s_exp,
-            size=n_nodes,
+            size=projected_tree.n_nodes,
             df=support,
             tf=weighted_support,
             where=[
@@ -279,13 +294,14 @@ class FREQTOriginal:
 
 ArrayTree = list[Node]
 
+
 # This does not improve __getitem__ performance. (In fact, it slows it down by 2x.)
-# def serialize_array_tree(array_tree: ArrayTree) -> bytes:
-#     return msgpack.packb([dataclass_as_dict(node) for node in array_tree])
-#
-#
-# def deserialize_array_tree(data: bytes | memoryview) -> ArrayTree:
-#     return [Node(**x) for x in msgpack.unpackb(data)]
+def serialize_array_tree(array_tree: ArrayTree) -> bytes:
+    return msgpack.packb([node.__dict__ for node in array_tree])
+
+
+def deserialize_array_tree(data: bytes | memoryview) -> ArrayTree:
+    return [Node(**x) for x in msgpack.unpackb(data)]
 # #
 
 
@@ -351,6 +367,7 @@ class LMDBTreeTransactionsStore:
                 # nodes = deserialize_array_tree(v_bin)
                 yield k, nodes
 
+    @ft.lru_cache(1_000)
     def __getitem__(self, idx: int) -> ArrayTree:
         k_bin = struct.pack("n", idx)
         with self._lmdb_env.begin(db=self._txn_db, buffers=True) as txn:
@@ -359,7 +376,7 @@ class LMDBTreeTransactionsStore:
                 raise IndexError
             else:
                 return pickle.loads(v)
-            # return deserialize_array_tree(v)
+                # return deserialize_array_tree(v)
 
     # @ft.cached_property
     # def __read_txn(self):
