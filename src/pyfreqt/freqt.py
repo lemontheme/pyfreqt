@@ -9,18 +9,19 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, List, Iterable, Optional, Iterator, TypedDict, Dict, Callable
 import pickle
+import marshal
 
 import msgpack
 import lmdb
 from tqdm import tqdm
 
 
-@dataclass(slots=True)
-class Node:
-    value: Optional[str] = None
-    sibling: int = -1
-    child: int = -1
-    parent: int = -1
+# @dataclass(slots=True)
+class Node(TypedDict):
+    value: Optional[str]  # = None
+    sibling: int  # = -1
+    child: int  # = -1
+    parent: int  # = -1
 
 
 @dataclass(slots=True)
@@ -32,8 +33,8 @@ class ProjectedTree:  # struct projected_t in reference implementation.
 
 
 class _SubtreeRightMostChildLocation(TypedDict):
-    txn_idx: int
-    node_idx: int  # preorder
+    t_idx: int
+    po_idx: int  # preorder node index
 
 
 class SubtreeDict(TypedDict):
@@ -78,7 +79,7 @@ def parse_s_expr(s_expr: str) -> List[Node]:  # `str2node` in reference implemen
     #    Create list of ints `siblings`
 
     # Result
-    nodes: List[Node] = [Node() for _ in range(n_nodes)]
+    nodes: List[Node] = [Node(value=None, sibling=-1, child=-1, parent=-1) for _ in range(n_nodes)]
     # Right-most child assoc'd with parent.
     siblings: List[int] = [-1] * n_nodes
 
@@ -92,21 +93,21 @@ def parse_s_expr(s_expr: str) -> List[Node]:  # `str2node` in reference implemen
                 continue
 
             parent_idx, child_idx = stack[-2:]
-            nodes[child_idx].parent = parent_idx
+            nodes[child_idx]["parent"] = parent_idx
 
             parent_node = nodes[parent_idx]
-            if parent_node.child == -1:
-                parent_node.child = child_idx
+            if parent_node["child"] == -1:
+                parent_node["child"] = child_idx
 
             prev_child_of_parent_idx = siblings[parent_idx]
             if prev_child_of_parent_idx != -1:
-                nodes[prev_child_of_parent_idx].sibling = child_idx
+                nodes[prev_child_of_parent_idx]["sibling"] = child_idx
 
             siblings[parent_idx] = child_idx
             stack = stack[:-1]  # drop child.
 
         else:  # In case of token representing node.
-            nodes[node_idx].value = token
+            nodes[node_idx]["value"] = token
             stack.append(node_idx)
             node_idx += 1
 
@@ -148,7 +149,7 @@ class FREQTOriginal:
         freq1: defaultdict[tuple[str], ProjectedTree] = defaultdict(ProjectedTree)
         for i, transaction in self._transaction_store:
             for j, node in enumerate(transaction):
-                freq1[(node.value,)].locations.append((i, j))
+                freq1[(node["value"],)].locations.append((i, j))
 
         # self._prune(freq1)
 
@@ -206,24 +207,25 @@ class FREQTOriginal:
                 prefix: tuple[str, ...] = ()
                 current_depth: int = -1
                 transaction_nodes: list[Node] = self._transaction_store[transaction_idx]
+
                 while current_depth < tree_depth and pos_idx != -1:
                     start = (
-                        transaction_nodes[pos_idx].child
+                        transaction_nodes[pos_idx]["child"]
                         if current_depth == -1
-                        else transaction_nodes[pos_idx].sibling
+                        else transaction_nodes[pos_idx]["sibling"]
                     )
                     new_depth = tree_depth - current_depth
                     next_node_idx = start  # 'l' in reference.
                     while next_node_idx != -1:
                         next_node: Node = transaction_nodes[next_node_idx]
-                        item: tuple[str, ...] = prefix + (next_node.value,)
+                        item: tuple[str, ...] = prefix + (next_node["value"],)
                         candidate = candidates[item]
                         candidate.locations.append((transaction_idx, next_node_idx))
                         candidate.depth = new_depth
                         # Finally
-                        next_node_idx = next_node.sibling
+                        next_node_idx = next_node["sibling"]
                     if current_depth != -1:
-                        pos_idx = transaction_nodes[pos_idx].parent  # Go up right-most branch.
+                        pos_idx = transaction_nodes[pos_idx]["parent"]  # Go up right-most branch.
                     prefix += (")",)
                     current_depth += 1
 
@@ -265,9 +267,7 @@ class FREQTOriginal:
         return support
 
     @staticmethod
-    def _report(
-        projected_tree: ProjectedTree, pattern_toks: tuple[str]
-    ) -> Optional[SubtreeDict]:
+    def _report(projected_tree: ProjectedTree, pattern_toks: tuple[str]) -> Optional[SubtreeDict]:
         s_exp: str = ""
         par_balance: int = 0
         for tok in pattern_toks:
@@ -286,8 +286,7 @@ class FREQTOriginal:
             df=support,
             tf=weighted_support,
             where=[
-                _SubtreeRightMostChildLocation(txn_idx=tree_i, node_idx=node_j)
-                for tree_i, node_j in projected_tree.locations
+                {"t_idx": tree_i, "po_idx": node_j} for tree_i, node_j in projected_tree.locations
             ],
         )
 
@@ -296,12 +295,14 @@ ArrayTree = list[Node]
 
 
 # This does not improve __getitem__ performance. (In fact, it slows it down by 2x.)
-def serialize_array_tree(array_tree: ArrayTree) -> bytes:
-    return msgpack.packb([node.__dict__ for node in array_tree])
+# def serialize_array_tree(array_tree: ArrayTree) -> bytes:
+#     return msgpack.packb([node.__dict__ for node in array_tree])
+#
+#
+# def deserialize_array_tree(data: bytes | memoryview) -> ArrayTree:
+#     return [Node(**x) for x in msgpack.unpackb(data)]
 
 
-def deserialize_array_tree(data: bytes | memoryview) -> ArrayTree:
-    return [Node(**x) for x in msgpack.unpackb(data)]
 # #
 
 
@@ -352,7 +353,8 @@ class LMDBTreeTransactionsStore:
             else:
                 next_key = 0
             bin_keys_iter = (struct.pack("n", i) for i in it.count(next_key))
-            bin_trees_iter = (pickle.dumps(t, protocol=5) for t in trees)
+            # bin_trees_iter = (pickle.dumps(t, protocol=5) for t in trees)
+            bin_trees_iter = (marshal.dumps(t) for t in trees)
             # bin_trees_iter = (serialize_array_tree(t) for t in trees)
             index_stream = zip(bin_keys_iter, bin_trees_iter)
             cursor.putmulti(index_stream, dupdata=False, append=True)
@@ -363,11 +365,12 @@ class LMDBTreeTransactionsStore:
             cursor.first()
             for k_bin, v_bin in cursor:
                 (k,) = struct.unpack("n", k_bin)
-                nodes = pickle.loads(v_bin)
+                # nodes = pickle.loads(v_bin)
+                nodes = marshal.loads(v_bin)
                 # nodes = deserialize_array_tree(v_bin)
                 yield k, nodes
 
-    @ft.lru_cache(1_000)
+    @ft.lru_cache(10_000)
     def __getitem__(self, idx: int) -> ArrayTree:
         k_bin = struct.pack("n", idx)
         with self._lmdb_env.begin(db=self._txn_db, buffers=True) as txn:
@@ -375,7 +378,8 @@ class LMDBTreeTransactionsStore:
             if v is None:
                 raise IndexError
             else:
-                return pickle.loads(v)
+                # return pickle.loads(v)
+                return marshal.loads(v)
                 # return deserialize_array_tree(v)
 
     # @ft.cached_property

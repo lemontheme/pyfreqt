@@ -49,7 +49,7 @@ def run_freqt(
         prune_pred=keep_candidate
     )
     # original: 11_693_846
-    max_trees = 100_000
+    max_trees = 1000_000
     freqt.index_trees(it.islice(in_ndsexp, max_trees), total=max_trees)
     logger.info("Initial tree indexing complete.")
     patt: SubtreeDict
