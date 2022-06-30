@@ -7,7 +7,10 @@ import functools as ft
 from dataclasses import dataclass, field, asdict as dataclass_as_dict
 from collections import defaultdict
 from pathlib import Path
-from typing import Tuple, List, Iterable, Optional, Iterator, TypedDict, Dict, Callable
+from typing import (
+    Tuple, List, Iterable, Optional, Iterator, TypedDict, Dict, Callable, Protocol,
+    Sequence,
+)
 import pickle
 import marshal
 
@@ -28,8 +31,10 @@ class Node(TypedDict):
 class ProjectedTree:  # struct projected_t in reference implementation.
     depth: int = -1
     support: int = 0
+    weighted_support: int = 0
     locations: List[Tuple[int, int]] = field(default_factory=list)
     n_nodes: int = -1
+    extra: dict = field(default_factory=dict)
 
 
 class _SubtreeRightMostChildLocation(TypedDict):
@@ -39,10 +44,11 @@ class _SubtreeRightMostChildLocation(TypedDict):
 
 class SubtreeDict(TypedDict):
     pattern: str
-    df: int
-    tf: int  # 'weighted support' in reference inplementation.
+    support: int
+    wsupport: int
     size: int  # i.e. number of nodes
     where: List[_SubtreeRightMostChildLocation]
+    extra: dict
 
 
 def tokenize_s_expr(s_exp: str) -> Iterable[str]:
@@ -114,6 +120,13 @@ def parse_s_expr(s_expr: str) -> List[Node]:  # `str2node` in reference implemen
     return nodes
 
 
+class CandidateCriterionFn(Protocol):
+    def __call__(
+        self, patt_toks: Sequence[str], support: int, n_nodes: int, out_data: dict[str, Any]
+    ) -> bool:
+        ...
+
+
 @dataclass
 class FREQTOriginal:
     min_support: int = 1
@@ -121,7 +134,7 @@ class FREQTOriginal:
     max_nodes: int = 10e4  # `max_pat` in reference. doc: max pattern length
     weighted: bool = False  # Use weighted support.
     enc: bool = False  # Use internal string encoding format as output.
-    prune_pred: Callable = None
+    custom_criterion: Optional[Callable] = None
     cache_dir: Optional[Path] = None
     _transaction_store: InMemoryTreeTransactionsStore | LMDBTreeTransactionsStore = field(
         init=False, repr=False, default_factory=list
@@ -134,8 +147,8 @@ class FREQTOriginal:
             self._transaction_store = LMDBTreeTransactionsStore(db_path=transactions_db_prefix)
         else:
             self._transaction_store = InMemoryTreeTransactionsStore()
-        if self.prune_pred is None:
-            self.prune_pred = lambda patt_toks, support, n_nodes: True
+        if self.custom_criterion is None:
+            self.custom_criterion = lambda patt_toks, support, n_nodes, out_data: True
 
     # NEW
     def index_trees(self, s_exprs: Iterable[str], total: int = None) -> None:
@@ -166,24 +179,32 @@ class FREQTOriginal:
         stack: list[tuple[tuple[str, ...], ProjectedTree]] = [(pattern_toks, projected_tree)]
         candidates: defaultdict[tuple[str, ...], ProjectedTree] = defaultdict(ProjectedTree)
 
+        print(f"|Proj tree locations| = {len(projected_tree.locations)}")
+
         min_nodes: int = self.min_nodes
         max_nodes: int = self.max_nodes
 
         while stack:
             pattern_toks, projected_tree = stack.pop()
 
+            if len(stack) > 100:
+                print(f"|Stack | = {len(stack)}")
+
             # <Pruning Step>
-            support: int = self._compute_support(projected_tree)
-            if support < self.min_support:
+            support: int
+            wsupport: int
+            support, wsupport = self._compute_supports(projected_tree)
+            if (wsupport if self.weighted else support) < self.min_support:
                 continue
             n_nodes = sum(1 for tok in pattern_toks if tok != ")")
             if n_nodes > max_nodes:
                 continue
-            if not self.prune_pred(pattern_toks, support, n_nodes):
+            if not self.custom_criterion(pattern_toks, support, n_nodes, projected_tree.extra):
                 continue
             # </Pruning Step>
 
             projected_tree.support = support
+            projected_tree.weighted_support = wsupport
             projected_tree.n_nodes = n_nodes
 
             if min_nodes <= n_nodes:
@@ -221,6 +242,9 @@ class FREQTOriginal:
                         item: tuple[str, ...] = prefix + (next_node["value"],)
                         candidate = candidates[item]
                         candidate.locations.append((transaction_idx, next_node_idx))
+                        # temp
+                        # print(pattern_toks, item, (transaction_idx, next_node_idx))
+                        # //
                         candidate.depth = new_depth
                         # Finally
                         next_node_idx = next_node["sibling"]
@@ -228,6 +252,9 @@ class FREQTOriginal:
                         pos_idx = transaction_nodes[pos_idx]["parent"]  # Go up right-most branch.
                     prefix += (")",)
                     current_depth += 1
+
+            print(f"|Candidates| = {len(candidates)}")
+            print(f"avg(|candidate.locations|) = {sum(len(projt.locations) for projt in candidates.values()) / len(candidates)} ")
 
             for pattern, project_t in candidates.items():
                 new_pattern_toks = pattern_toks + pattern
@@ -254,17 +281,18 @@ class FREQTOriginal:
     #     for pattern in to_prune:
     #         del candidates[pattern]
 
-    def _compute_support(self, projected_tree: ProjectedTree) -> int:
+    def _compute_supports(self, projected_tree: ProjectedTree) -> tuple[int, int]:
         tree = projected_tree
-        if self.weighted:
-            return len(tree.locations)  # All occurences.
-        old: Optional[int] = -1
-        support: int = 0
+        weighted_support = len(tree.locations)
+        # if self.weighted:
+        #     return  # All occurences.
+        prev_txn_idx: Optional[int] = -1
+        standard_support: int = 0
         for transaction_idx, _ in tree.locations:
-            if transaction_idx != old:  # Max one occurence per tree/transaction.
-                support += 1
-            old = transaction_idx
-        return support
+            if transaction_idx != prev_txn_idx:  # Max one occurence per tree/transaction.
+                standard_support += 1
+            prev_txn_idx = transaction_idx
+        return standard_support, weighted_support
 
     @staticmethod
     def _report(projected_tree: ProjectedTree, pattern_toks: tuple[str]) -> Optional[SubtreeDict]:
@@ -278,16 +306,17 @@ class FREQTOriginal:
                 s_exp = f"{s_exp}({tok}"
                 par_balance += 1
         s_exp = f"{s_exp}{')' * max(0, par_balance)}"
-        support = projected_tree.support
         weighted_support = len(projected_tree.locations)  # ?
         return SubtreeDict(
             pattern=s_exp,
             size=projected_tree.n_nodes,
-            df=support,
-            tf=weighted_support,
-            where=[
-                {"t_idx": tree_i, "po_idx": node_j} for tree_i, node_j in projected_tree.locations
-            ],
+            support=projected_tree.support,
+            wsupport=projected_tree.weighted_support,
+            extra=projected_tree.extra,
+            where=[t_i for t_i, _ in projected_tree.locations]
+                # {"t_idx": tree_i, "po_idx": node_j} for tree_i, node_j in projected_tree.locations
+            # ],
+            # where=list(set(t_i for t_i, _ in projected_tree.locations))
         )
 
 
